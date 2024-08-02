@@ -41,7 +41,7 @@ def home():
     image_count_div = Div(id='image-count', hx_get="/image_count", hx_trigger="load", hx_swap="innerHTML")
 
     return Title('Image Generation Demo'), Main(
-        H1('Magic Image Generation'),
+        H1('Text to Image Generation by JK'),
         add,
         image_count_div,  # Add the image count display
         gen_list,
