@@ -1,113 +1,103 @@
-from fastcore.parallel import threaded
-from fasthtml.common import *
-import uuid, os, uvicorn, requests, glob
-from PIL import Image
-import io
+import streamlit as st
+from PyPDF2 import PdfReader
+from langchain_text_splitters import RecursiveCharacterTextSplitter
+from langchain_community.vectorstores import FAISS
+from langchain_huggingface import HuggingFaceEmbeddings
+from groq import Groq
+import os
+import pickle
 from dotenv import load_dotenv
 
 # Load environment variables from .env file
 load_dotenv()
-API_KEY = os.getenv("HUGGINGFACE_API_KEY")
-API_URL = "https://api-inference.huggingface.co/models/alvdansen/littletinies"
-headers = {"Authorization": f"Bearer {API_KEY}"}
 
-# Function to query the Hugging Face API
-def query(payload):
-    response = requests.post(API_URL, headers=headers, json=payload)
-    return response.content
+@st.cache_resource
+def initialize_groq_llm():
+    # Initialize the Groq language model with API key from environment
+    api_key = os.getenv("GROQ_API_KEY")
+    if not api_key:
+        st.error("API key is missing. Please check your .env file.")
+        return None
+    return Groq(api_key=api_key)
 
-# Database setup
-tables = database('data/gens.db').t
-gens = tables.gens
-if not gens in tables:
-    gens.create(prompt=str, id=int, folder=str, pk='id')
-Generation = gens.dataclass()
+def load_vector_store(pdf_path, embeddings, store_name):
+    # Load existing vector store or create a new one from the PDF
+    if os.path.exists(f"{store_name}.pkl"):
+        with open(f"{store_name}.pkl", "rb") as f:
+            return pickle.load(f)
+    else:
+        # Extract text from PDF and create vector store
+        pdf_reader = PdfReader(pdf_path)
+        text = "".join([page.extract_text() for page in pdf_reader.pages])
+        text_splitter = RecursiveCharacterTextSplitter(chunk_size=1000, chunk_overlap=200, length_function=len)
+        chunks = text_splitter.split_text(text=text)
+        vector_store = FAISS.from_texts(chunks, embedding=embeddings)
+        with open(f"{store_name}.pkl", "wb") as f:
+            pickle.dump(vector_store, f)
+        return vector_store
 
-# Flexbox CSS (http://flexboxgrid.com/)
-gridlink = Link(rel="stylesheet", href="https://cdnjs.cloudflare.com/ajax/libs/flexboxgrid/6.3.1/flexboxgrid.min.css", type="text/css")
+def main():
+    # Main function to run the Streamlit app
+    st.title("Simple RAG Application")
 
-# Our FastHTML app
-app = FastHTML(hdrs=(picolink, gridlink))
+    llm = initialize_groq_llm()
+    if llm is None:
+        return  # Exit if the API key is not available
 
-# Main page
-@app.get("/")
-def home():
-    inp = Input(id="new-prompt", name="prompt", placeholder="Enter a prompt")
-    add = Form(Group(inp, Button("Generate")), hx_post="/", target_id='gen-list', hx_swap="afterbegin")
-    gen_containers = [generation_preview(g) for g in gens(limit=10)]  # Start with last 10
-    gen_list = Div(*reversed(gen_containers), id='gen-list', cls="row")  # flexbox container: class = row
+    pdf_path = "document.pdf"
 
-    # Display the number of images
-    image_count_div = Div(id='image-count', hx_get="/image_count", hx_trigger="load", hx_swap="innerHTML")
+    # Define embedding models
+    embeddings_models = {
+        '300-dim': HuggingFaceEmbeddings(model_name="sentence-transformers/all-MiniLM-L6-v2"),
+        '700-dim': HuggingFaceEmbeddings(model_name="sentence-transformers/paraphrase-MiniLM-L6-v2"),
+        '1536-dim': HuggingFaceEmbeddings(model_name="sentence-transformers/all-mpnet-base-v2")
+    }
 
-    return Title('Image Generation Demo'), Main(
-        H1('Text to Image Generation by JK'),
-        add,
-        image_count_div,  # Add the image count display
-        gen_list,
-        cls='container'
-    )
+    # Load vector stores for each embedding model
+    vector_stores = {}
+    for name, embeddings in embeddings_models.items():
+        vector_stores[name] = load_vector_store(pdf_path, embeddings, f"vector_store_{name}")
 
-# Show the image (if available) and prompt for a generation
-def generation_preview(g):
-    grid_cls = "box col-xs-12 col-sm-6 col-md-4 col-lg-3"
-    image_path = f"{g.folder}/{g.id}.png"
-    delete_button = Button("Delete", hx_delete=f"/gens/{g.id}", hx_confirm="Are you sure you want to delete this image?", hx_target=f'#gen-{g.id}', hx_swap="outerHTML", hx_trigger="click")
-    if os.path.exists(image_path):
-        return Div(Card(
-                       Img(src=image_path, alt="Card image", cls="card-img-top"),
-                       Div(P(B("Prompt: "), g.prompt, cls="card-text"), cls="card-body"),
-                       delete_button
-                   ), id=f'gen-{g.id}', cls=grid_cls)
-    return Div(f"Generating gen {g.id} with prompt {g.prompt}",
-            id=f'gen-{g.id}', hx_get=f"/gens/{g.id}",
-            hx_trigger="every 2s", hx_swap="outerHTML", cls=grid_cls)
+    query = st.text_input("**Ask your question:**")
 
-# A pending preview keeps polling this route until we return the image preview
-@app.get("/gens/{id}")
-def preview(id:int):
-    return generation_preview(gens.get(id))
+    if query:
+        responses = {}
+        # Search and get responses from each vector store
+        for name, vector_store in vector_stores.items():
+            st.write(f"Searching in vector store: {name}")
+            docs = vector_store.similarity_search(query=query, k=3)
 
-# For images, CSS, etc.
-@app.get("/{fname:path}.{ext:static}")
-def static(fname:str, ext:str):
-    return FileResponse(f'{fname}.{ext}')
+            if not docs:
+                st.write(f"No documents found in {name} vector store.")
+                responses[name] = "No documents found."
+                continue
 
-# Generation route
-@app.post("/")
-def post(prompt:str):
-    folder = f"data/gens/{str(uuid.uuid4())}"
-    os.makedirs(folder, exist_ok=True)
-    g = gens.insert(Generation(prompt=prompt, folder=folder))
-    generate_and_save(g.prompt, g.id, g.folder)
-    clear_input = Input(id="new-prompt", name="prompt", placeholder="Enter a prompt", hx_swap_oob='true')
-    return generation_preview(g), clear_input
+            st.write(f"Found {len(docs)} documents in {name} vector store.")
+            snippets = " ".join([doc.page_content for doc in docs])
+            st.write(f"Document snippets: {snippets}")
 
-# Delete route
-@app.delete("/gens/{id}")
-def delete_gen(id:int):
-    gen = gens.get(id)
-    if gen:
-        image_path = f"{gen.folder}/{gen.id}.png"
-        if os.path.exists(image_path):
-            os.remove(image_path)
-        gens.delete(id)
-    return "Hit Refresh!"
+            # Generate a response from the Groq language model
+            prompt = f"Given the following document snippets, provide a detailed and relevant response to the query: '{query}'.\n\nDocument Snippets:\n{snippets}"
+            try:
+                result = llm.chat.completions.create(
+                    model="llama3-70b-8192",
+                    messages=[
+                        {"role": "system", "content": "Provide detailed and clear responses based on the provided document snippets."},
+                        {"role": "user", "content": prompt}
+                    ]
+                )
+                response_content = result.choices[0].message.content
+            except Exception as e:
+                st.write(f"Error occurred: {e}")
+                response_content = "An error occurred while generating the response."
 
-# Generate an image and save it to the folder (in a separate thread)
-@threaded
-def generate_and_save(prompt, id, folder):
-    image_bytes = query({"inputs": prompt})
-    image = Image.open(io.BytesIO(image_bytes))
-    image.save(f"{folder}/{id}.png")
-    return True
+            responses[name] = response_content
 
-# Count PNG images
-@app.get("/image_count")
-def image_count():
-    png_files = glob.glob("data/gens/**/*.png", recursive=True)
-    count = len(png_files)
-    return f"Number of images generated: {count}"
+        # Display responses from different embedding models
+        st.subheader("Responses from Different Embeddings:")
+        for name, response in responses.items():
+            st.write(f"**{name}**:")
+            st.write(response)
 
 if __name__ == '__main__':
-    uvicorn.run("main:app", host='0.0.0.0', port=int(os.getenv("PORT", default=8000)))
+    main()
